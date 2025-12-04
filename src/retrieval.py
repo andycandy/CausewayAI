@@ -1,0 +1,300 @@
+import json
+import pickle
+import os
+import networkx as nx
+import itertools
+from typing import List, AsyncGenerator
+from google import genai
+from google.genai import types
+from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchAny
+from pydantic import BaseModel
+from sentence_transformers import SentenceTransformer
+
+GRAPH_PATH = "data_artifacts/knowledge_graph.gpickle"
+QDRANT_PATH = "data_artifacts/qdrant_storage"
+
+with open("data_raw/master_enum_list.json", "r") as f: 
+    ENUMS = json.load(f)
+
+client = None
+qdrant_client = None
+G = None
+G_undirected = None
+model = None
+
+def init_resources():
+    """Call this ONCE from main.py lifespan"""
+    global model, qdrant_client, G, G_undirected, client
+    client = genai.Client(api_key="AIzaSyBeL9GktH8nr6JnJI-WFgZxcsvcwlHyGu0")
+    model = SentenceTransformer("google/embeddinggemma-300m", trust_remote_code=True)
+    qdrant_client = QdrantClient(path=QDRANT_PATH)
+    
+    with open(GRAPH_PATH, "rb") as f:
+        G = pickle.load(f)
+    G_undirected = G.to_undirected()
+    print("initiallized resources")
+
+
+def reformulate_query(query: str, chat_history: list) -> str:
+    """
+    If history exists, rewrite the query to be self-contained.
+    If no history, return original query.
+    """
+    if not chat_history:
+        return query
+    
+    history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history])
+    
+    prompt = f"""
+    You are a Query Resolver.
+    
+    CHAT HISTORY:
+    {history_text}
+    
+    LATEST USER QUERY: "{query}"
+    
+    TASK:
+    Rewrite the Latest User Query to be a standalone search query.
+    - Replace pronouns ("it", "that", "he") with the specific entities from history.
+    - Keep the intent (e.g., "Show me an example" -> "Show me an example of [Previous Logic]").
+    - Output ONLY the rewritten string.
+    """
+    
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        rewritten = response.text.strip()
+        return rewritten
+    except:
+        return query
+
+def get_embedding(text: str):
+    q_vec = model.encode(text, normalize_embeddings=True).tolist()
+    return q_vec
+
+async def run_graph_strategy(user_query: str, chat_history: list) -> AsyncGenerator:
+    yield {"event": "status", "data": "Init"}
+    
+    if client is None:
+        raise ValueError("Gemini Client is None! Init failed?")
+    if qdrant_client is None:
+        raise ValueError("Qdrant Client is None! Init failed?")
+
+
+    refined_query = reformulate_query(user_query, chat_history)
+    q_vec = get_embedding(refined_query)
+    hits = qdrant_client.query_points("inter_iit_knowledge_graph", query=q_vec).points
+    
+    entry_calls = set()
+    entry_concepts = []
+    
+    for h in hits:
+        if h.score < 0.5: continue
+        
+        nid = h.payload['node_id']
+        ntype = h.payload['type']
+        if ntype == 'Call': entry_calls.add(nid)
+        elif ntype == 'Concept': entry_concepts.append(nid)
+        
+    entry_concepts = list(dict.fromkeys(entry_concepts))
+    
+    if entry_concepts:
+        yield {"event": "concepts", "data": entry_concepts}
+
+    final_evidence_ids = set(entry_calls)
+    
+    yield {"event": "status", "data": "Traversing Causal Logic..."}
+
+    if entry_concepts and G:
+        if len(entry_concepts) == 1:
+            concept = entry_concepts[0]
+            if concept in G:
+                neighbors = list(G_undirected.neighbors(concept))
+                calls = [n for n in neighbors if G.nodes[n].get('type') == 'Call']
+                final_evidence_ids.update(calls[:10])
+
+        else:
+            concept_call_map = {}
+            for c in entry_concepts:
+                if c not in G: continue
+                neighbors = list(G_undirected.neighbors(c))
+                valid = {n for n in neighbors if G.nodes[n].get('type') == 'Call'}
+                if valid: concept_call_map[c] = valid
+
+            # Intersection
+            if concept_call_map:
+                intersection = set.intersection(*concept_call_map.values())
+                if intersection:
+                    final_evidence_ids.update(list(intersection))
+                else:
+                    # Pathfinding
+                    path_nodes = set()
+                    for start, end in itertools.combinations(entry_concepts, 2):
+                        try:
+                            if nx.has_path(G_undirected, start, end):
+                                path = nx.shortest_path(G_undirected, start, end)
+                                if len(path) <= 4: path_nodes.update(path)
+                        except: pass
+                    
+                    for node in path_nodes:
+                        if G.nodes[node].get('type') == 'Call':
+                            final_evidence_ids.add(node)
+                        elif G.nodes[node].get('type') == 'Concept':
+                            nbs = list(G_undirected.neighbors(node))
+                            calls = [n for n in nbs if G.nodes[n].get('type') == 'Call']
+                            if calls: final_evidence_ids.add(calls[0])
+
+    sorted_ids = list(final_evidence_ids)[:40]
+    yield {"event": "sources", "ids": sorted_ids}
+    
+    evidence_texts = []
+
+    for cid in sorted_ids:
+        if cid in G:
+            data = G.nodes[cid]
+            text = data.get('full_text', '')
+            summary = data.get('summary', '')
+            
+            if len(text) > 50:
+                evidence_texts.append(f"CALL ID: {cid}\nSUMMARY: {summary}\nTRANSCRIPT:\n{text[:1000]}")
+                
+    if not evidence_texts:
+        yield {"event": "token", "data": "Graph logic found connections, but no transcripts were attached."}
+        return
+
+    context = "\n\n".join(evidence_texts)
+    prompt = f"""
+        You are a Senior Data Analyst.
+        QUERY: "{user_query}"
+        EVIDENCE: {context}
+        INSTRUCTIONS:
+        1. Answer the query using ONLY the evidence.
+        2. Cite Call IDs.
+        3. Explain the causal link.
+        4. Deny if no evidence is provided.
+    """
+    
+    yield {"event": "status", "data": "Streaming Answer..."}
+    
+    response = client.models.generate_content_stream(
+        model="gemini-2.5-flash",
+        contents=prompt
+    )
+    for chunk in response:
+        yield {"event": "token", "data": chunk.text}
+    return
+
+
+class SearchFilter(BaseModel):
+    field: str
+    value: List[str]
+
+class SearchPlan(BaseModel):
+    search_text: str
+    filters: List[SearchFilter]
+
+async def run_filter_strategy(user_query: str, chat_history: list) -> AsyncGenerator:
+    yield {"event": "status", "data": "Init"}
+    refined_query = reformulate_query(user_query, chat_history)
+    history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history]) if chat_history else "None"
+    prompt = f"""
+      You are a Search Query Planner for a Vector Database.
+
+      USER QUERY: "{user_query}"
+
+      CHAT HISTORY:
+      {history_str}
+
+      AVAILABLE FILTERS (Exact spelling required):
+      - domain: {ENUMS.get('domains', [])}
+      - outcome: {ENUMS.get('outcomes', [])}
+      - topics: {ENUMS.get('topics', [])}
+
+      INSTRUCTIONS:
+      1. Analyze the User Query and History.
+      2. Extract domain, outcome, or multiple topics FILTERS depending upon the user query and chat history.
+      3. Rewrite the 'search_text' to be a specific hypothetical question (HyDE) that would answer the user.
+      4. If the user pivots (changes topic), ignore previous history filters.
+    """
+    
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json", 
+            response_schema=SearchPlan, temperature=0.0
+        )
+    )
+    plan = resp.parsed
+    
+    yield {"event": "concepts", "data": [f"{f.field}:{f.value[0]}" for f in plan.filters]}
+
+    qdrant_filter = None
+    if plan.filters:
+        must_conditions = []
+        should_conditions = []
+        for f in plan.filters:
+            key = "topics" if f.field == "topic" else f.field
+            if key == 'domain': 
+                must_conditions.append(FieldCondition(key=key, match=MatchAny(any=f.value)))
+            else:
+                should_conditions.append(FieldCondition(key=key, match=MatchAny(any=f.value)))
+        
+        qdrant_filter = Filter(must=must_conditions, should=should_conditions)
+
+    yield {"event": "status", "data": "Executing Filtered Search..."}
+    q_vec = get_embedding(plan.search_text)
+    
+    hits = qdrant_client.query_points(
+        collection_name="inter_iit_conversations",
+        query=q_vec,
+        query_filter=qdrant_filter,
+        limit=40,
+        with_payload=True
+    ).points
+
+    evidence_text = ""
+    sources_payload = []
+    
+    for i, hit in enumerate(hits):
+        if hit.score < 0.4: continue
+        
+        payload = hit.payload 
+        if 'display_text' in payload:
+            evidence_text += f"\n--- EVIDENCE (Call ID: {payload.get('call_id')}) ---\n{payload.get('display_text')}\n"
+            
+            sources_payload.append({
+                "id": payload.get('call_id'),
+                "summary": payload.get('outcome', 'Call Log'),
+                "domain": payload.get('domain')
+            })
+
+    yield {"event": "sources", "data": sources_payload[:15]}
+
+    if not evidence_text:
+        yield {"event": "token", "data": "No relevant information found"}
+        return
+
+    yield {"event": "status", "data": "Synthesizing Answer..."}
+    
+    gen_prompt = f"""
+        You are an expert Call Center Analyst.
+
+        USER QUERY: {refined_query}
+
+        EVIDENCE FROM DATABASE:
+        {evidence_text}
+
+        INSTRUCTIONS:
+        1. Answer the query using ONLY the provided evidence.
+        2. Synthesize the root cause.
+        3. Cite specific Call IDs (e.g., INS-AKME-0002) to support every claim.
+        4. If the evidence talks about a specific technical error (like 'checksum'), mention it.
+    """
+    
+    response = client.models.generate_content_stream(model="gemini-2.5-flash", contents=gen_prompt)
+    for chunk in response:
+        yield {"event": "token", "data": chunk.text}
