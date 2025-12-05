@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  causal-app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - qdrant_data:/app/data_artifacts/qdrant_storage
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
