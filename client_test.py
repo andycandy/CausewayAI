@@ -67,9 +67,17 @@ class CausalClient:
             print(f"[CONCEPTS]: {data}")
         elif evt_type == "sources":
             ids = event.get("ids", [])
-            print(f"\n[SOURCES]: Found {len(ids)} relevant calls.")
+            data = event.get("data", [])
+            
             if ids:
+                print(f"\n[SOURCES]: Found {len(ids)} relevant calls.")
                 print(f"          IDs: {', '.join(ids[:5])}...")
+            elif data:
+                print(f"\n[SOURCES]: Found {len(data)} relevant calls.")
+                for item in data[:3]:
+                    print(f"          - {item.get('id')} ({item.get('domain')})")
+            else:
+                print("\n[SOURCES]: Found 0 relevant calls.")
         elif evt_type == "error":
             print(f"\n[SERVER ERROR]: {event.get('message')}")
         else:

@@ -2,6 +2,7 @@ fastapi==0.118.3
 uvicorn==0.27.0
 pydantic==2.12.3
 python-dotenv
+huggingface_hub
 networkx==3.6
 qdrant-client==1.16.1
 sentence-transformers==5.1.2

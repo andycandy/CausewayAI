@@ -10,6 +10,10 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchAny
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+import huggingface_hub
+
+load_dotenv()
 
 GRAPH_PATH = "data_artifacts/knowledge_graph.gpickle"
 QDRANT_PATH = "data_artifacts/qdrant_storage"
@@ -26,7 +30,12 @@ model = None
 def init_resources():
     """Call this ONCE from main.py lifespan"""
     global model, qdrant_client, G, G_undirected, client
-    client = genai.Client(api_key="AIzaSyBeL9GktH8nr6JnJI-WFgZxcsvcwlHyGu0")
+    
+    hf_token = os.getenv("HF_TOKEN")
+    if hf_token:
+        huggingface_hub.login(token=hf_token)
+
+    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
     model = SentenceTransformer("google/embeddinggemma-300m", trust_remote_code=True)
     qdrant_client = QdrantClient(path=QDRANT_PATH)
     
@@ -123,7 +132,7 @@ async def run_graph_strategy(user_query: str, chat_history: list) -> AsyncGenera
                 neighbors = list(G_undirected.neighbors(c))
                 valid = {n for n in neighbors if G.nodes[n].get('type') == 'Call'}
                 if valid: concept_call_map[c] = valid
-
+            
             # Intersection
             if concept_call_map:
                 intersection = set.intersection(*concept_call_map.values())
@@ -147,7 +156,7 @@ async def run_graph_strategy(user_query: str, chat_history: list) -> AsyncGenera
                             calls = [n for n in nbs if G.nodes[n].get('type') == 'Call']
                             if calls: final_evidence_ids.add(calls[0])
 
-    sorted_ids = list(final_evidence_ids)[:40]
+    sorted_ids = list(final_evidence_ids)
     yield {"event": "sources", "ids": sorted_ids}
     
     evidence_texts = []
@@ -238,12 +247,25 @@ async def run_filter_strategy(user_query: str, chat_history: list) -> AsyncGener
         should_conditions = []
         for f in plan.filters:
             key = "topics" if f.field == "topic" else f.field
+            
+            # Normalize values
+            enum_key = key + 's' if not key.endswith('s') else key
+            valid_values = ENUMS.get(enum_key, [])
+            
+            normalized_values = []
+            for v in f.value:
+                match = next((pv for pv in valid_values if pv.lower() == v.lower()), v)
+                normalized_values.append(match)
+
             if key == 'domain': 
-                must_conditions.append(FieldCondition(key=key, match=MatchAny(any=f.value)))
+                must_conditions.append(FieldCondition(key=key, match=MatchAny(any=normalized_values)))
             else:
-                should_conditions.append(FieldCondition(key=key, match=MatchAny(any=f.value)))
+                should_conditions.append(FieldCondition(key=key, match=MatchAny(any=normalized_values)))
         
-        qdrant_filter = Filter(must=must_conditions, should=should_conditions)
+        qdrant_filter = Filter(
+            must=must_conditions if must_conditions else None, 
+            should=should_conditions if should_conditions else None
+        )
 
     yield {"event": "status", "data": "Executing Filtered Search..."}
     q_vec = get_embedding(plan.search_text)
