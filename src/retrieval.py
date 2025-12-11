@@ -94,19 +94,42 @@ async def run_graph_strategy(user_query: str, chat_history: list) -> AsyncGenera
 
 
     refined_query = reformulate_query(user_query, chat_history)
-    q_vec = get_embedding(refined_query)
-    hits = qdrant_client.query_points("inter_iit_knowledge_graph", query=q_vec).points
     
+    # [FIX] Infer domain to restrict graph search
+    plan = await infer_filters(user_query, chat_history)
+    
+    # [Revert] Don't strict filter Qdrant initial query because Concepts might lack domain
+    q_vec = get_embedding(refined_query)
+    hits = qdrant_client.query_points("inter_iit_knowledge_graph", query=q_vec, limit=50).points
+
     entry_calls = set()
     entry_concepts = []
     
+    target_domain = None
+    if plan.filters:
+        for f in plan.filters:
+            if f.field == 'domain' and f.value:
+                target_domain = f.value[0] # Take first domain (e.g. "Telecom")
+                break
+    
+
     for h in hits:
         if h.score < 0.5: continue
         
         nid = h.payload['node_id']
         ntype = h.payload['type']
-        if ntype == 'Call': entry_calls.add(nid)
-        elif ntype == 'Concept': entry_concepts.append(nid)
+        
+        # [Filter] Only accept Calls from target domain
+        if ntype == 'Call': 
+            if target_domain:
+                # payload usually has 'domain'
+                if h.payload.get('domain') == target_domain:
+                    entry_calls.add(nid)
+            else:
+                 entry_calls.add(nid)
+                 
+        elif ntype == 'Concept': 
+            entry_concepts.append(nid)
         
     entry_concepts = list(dict.fromkeys(entry_concepts))
     
@@ -122,7 +145,16 @@ async def run_graph_strategy(user_query: str, chat_history: list) -> AsyncGenera
             concept = entry_concepts[0]
             if concept in G:
                 neighbors = list(G_undirected.neighbors(concept))
-                calls = [n for n in neighbors if G.nodes[n].get('type') == 'Call']
+                # [Filter] Check domain in graph
+                calls = []
+                for n in neighbors:
+                    if G.nodes[n].get('type') == 'Call':
+                        if target_domain:
+                            if G.nodes[n].get('domain') == target_domain:
+                                calls.append(n)
+                        else:
+                            calls.append(n)
+                            
                 final_evidence_ids.update(calls[:10])
 
         else:
@@ -130,7 +162,16 @@ async def run_graph_strategy(user_query: str, chat_history: list) -> AsyncGenera
             for c in entry_concepts:
                 if c not in G: continue
                 neighbors = list(G_undirected.neighbors(c))
-                valid = {n for n in neighbors if G.nodes[n].get('type') == 'Call'}
+                
+                valid = set()
+                for n in neighbors:
+                    if G.nodes[n].get('type') == 'Call':
+                        if target_domain:
+                            if G.nodes[n].get('domain') == target_domain:
+                                valid.add(n)
+                        else:
+                            valid.add(n)
+                            
                 if valid: concept_call_map[c] = valid
             
             # Intersection
@@ -157,19 +198,30 @@ async def run_graph_strategy(user_query: str, chat_history: list) -> AsyncGenera
                             if calls: final_evidence_ids.add(calls[0])
 
     sorted_ids = list(final_evidence_ids)
-    yield {"event": "sources", "ids": sorted_ids}
     
+    # [FIX] Send full source details including transcript
+    sources_payload = []
     evidence_texts = []
-
+    
     for cid in sorted_ids:
         if cid in G:
             data = G.nodes[cid]
             text = data.get('full_text', '')
             summary = data.get('summary', '')
+            domain = data.get('domain', 'Unknown')
+            
+            sources_payload.append({
+                "id": cid,
+                "summary": summary,
+                "full_text": text,
+                "domain": domain
+            })
             
             if len(text) > 50:
                 evidence_texts.append(f"CALL ID: {cid}\nSUMMARY: {summary}\nTRANSCRIPT:\n{text[:1000]}")
-                
+    
+    yield {"event": "sources", "data": sources_payload}
+
     if not evidence_texts:
         yield {"event": "token", "data": "Graph logic found connections, but no transcripts were attached."}
         return
@@ -205,30 +257,23 @@ class SearchPlan(BaseModel):
     search_text: str
     filters: List[SearchFilter]
 
-async def run_filter_strategy(user_query: str, chat_history: list) -> AsyncGenerator:
-    yield {"event": "status", "data": "Init"}
-    refined_query = reformulate_query(user_query, chat_history)
+async def infer_filters(user_query: str, chat_history: list) -> SearchPlan:
+    """Helper to infer domain/filters using Gemini."""
     history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history]) if chat_history else "None"
     prompt = f"""
-      You are a Search Query Planner for a Vector Database.
-
+      You are a Search Query Planner.
       USER QUERY: "{user_query}"
-
-      CHAT HISTORY:
-      {history_str}
-
-      AVAILABLE FILTERS (Exact spelling required):
+      CHAT HISTORY: {history_str}
+      AVAILABLE FILTERS:
       - domain: {ENUMS.get('domains', [])}
       - outcome: {ENUMS.get('outcomes', [])}
       - topics: {ENUMS.get('topics', [])}
 
       INSTRUCTIONS:
-      1. Analyze the User Query and History.
-      2. Extract domain, outcome, or multiple topics FILTERS depending upon the user query and chat history.
-      3. Rewrite the 'search_text' to be a specific hypothetical question (HyDE) that would answer the user.
-      4. If the user pivots (changes topic), ignore previous history filters.
+      1. Analyze the User Query.
+      2. PREDICT THE DOMAIN. This is critical.
+      3. Return NULL for others if unsure.
     """
-    
     resp = client.models.generate_content(
         model="gemini-2.5-flash",
         contents=prompt,
@@ -237,7 +282,12 @@ async def run_filter_strategy(user_query: str, chat_history: list) -> AsyncGener
             response_schema=SearchPlan, temperature=0.0
         )
     )
-    plan = resp.parsed
+    return resp.parsed
+
+async def run_filter_strategy(user_query: str, chat_history: list) -> AsyncGenerator:
+    yield {"event": "status", "data": "Init"}
+    refined_query = reformulate_query(user_query, chat_history)
+    plan = await infer_filters(user_query, chat_history)
     
     yield {"event": "concepts", "data": [f"{f.field}:{f.value[0]}" for f in plan.filters]}
 
@@ -291,7 +341,8 @@ async def run_filter_strategy(user_query: str, chat_history: list) -> AsyncGener
             sources_payload.append({
                 "id": payload.get('call_id'),
                 "summary": payload.get('outcome', 'Call Log'),
-                "domain": payload.get('domain')
+                "domain": payload.get('domain'),
+                "full_text": payload.get('display_text') 
             })
 
     yield {"event": "sources", "data": sources_payload[:15]}
