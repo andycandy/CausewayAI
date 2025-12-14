@@ -1,11 +1,16 @@
 import json
 import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from src.retrieval import run_graph_strategy, run_filter_strategy, init_resources
+
+limiter = Limiter(key_func=get_remote_address)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -13,6 +18,8 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="CausewayAI Causal Engine", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,11 +34,13 @@ class ChatRequest(BaseModel):
     model_type: str = "graph" 
 
 @app.get("/health")
-def health():
+@limiter.limit("30/minute")
+def health(request: Request):
     return {"status": "ready"}
 
 @app.post("/chat")
-async def chat_endpoint(req: ChatRequest):
+@limiter.limit("5/minute")
+async def chat_endpoint(request: Request, req: ChatRequest):
     """
     Streaming Endpoint.
     Returns: Server-Sent Events (SSE)
