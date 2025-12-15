@@ -17,3 +17,7 @@ MODEL_ID = "google/embeddinggemma-300m"
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     print("GOOGLE_API_KEY not found in environment variables.")
+
+# Qdrant Cloud config (optional - falls back to local if not set)
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")

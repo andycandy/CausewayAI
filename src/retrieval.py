@@ -13,7 +13,7 @@ from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 import huggingface_hub
 
-from src.config import GRAPH_PATH, QDRANT_PATH, ENUMS_PATH, MODEL_ID
+from src.config import GRAPH_PATH, QDRANT_PATH, ENUMS_PATH, MODEL_ID, QDRANT_URL, QDRANT_API_KEY
 
 load_dotenv()
 
@@ -36,7 +36,13 @@ def init_resources():
 
     client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
     model = SentenceTransformer(MODEL_ID, trust_remote_code=True)
-    qdrant_client = QdrantClient(path=str(QDRANT_PATH))
+
+    if QDRANT_URL and QDRANT_API_KEY:
+        print("Connecting to Qdrant Cloud...")
+        qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    else:
+        print("Connecting to local Qdrant...")
+        qdrant_client = QdrantClient(path=str(QDRANT_PATH))
     
     with open(GRAPH_PATH, "rb") as f:
         G = pickle.load(f)

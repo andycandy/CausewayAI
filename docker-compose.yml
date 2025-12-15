@@ -8,6 +8,8 @@ services:
     environment:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - HF_TOKEN=${HF_TOKEN}
+      - QDRANT_URL=${QDRANT_URL}
+      - QDRANT_API_KEY=${QDRANT_API_KEY}
     volumes:
       - qdrant_data:/app/data_artifacts/qdrant_storage
     restart: unless-stopped
