@@ -12,7 +12,7 @@ async def lifespan(app: FastAPI):
     init_resources()
     yield
 
-app = FastAPI(title="Observe.AI Causal Engine", lifespan=lifespan)
+app = FastAPI(title="CausewayAI Causal Engine", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

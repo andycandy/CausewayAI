@@ -8,3 +8,4 @@ qdrant-client
 sentence-transformers
 google-genai
 torch
+huggingface-hub

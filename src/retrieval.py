@@ -13,12 +13,11 @@ from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 import huggingface_hub
 
+from src.config import GRAPH_PATH, QDRANT_PATH, ENUMS_PATH, MODEL_ID
+
 load_dotenv()
 
-GRAPH_PATH = "data_artifacts/knowledge_graph.gpickle"
-QDRANT_PATH = "data_artifacts/qdrant_storage"
-
-with open("data_raw/master_enum_list.json", "r") as f: 
+with open(ENUMS_PATH, "r") as f:
     ENUMS = json.load(f)
 
 client = None
@@ -36,8 +35,8 @@ def init_resources():
         huggingface_hub.login(token=hf_token)
 
     client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-    model = SentenceTransformer("google/embeddinggemma-300m", trust_remote_code=True)
-    qdrant_client = QdrantClient(path=QDRANT_PATH)
+    model = SentenceTransformer(MODEL_ID, trust_remote_code=True)
+    qdrant_client = QdrantClient(path=str(QDRANT_PATH))
     
     with open(GRAPH_PATH, "rb") as f:
         G = pickle.load(f)
